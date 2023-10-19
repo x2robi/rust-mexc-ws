@@ -28,7 +28,7 @@ async fn main() {
     let mut sockets: Vec<WebSocket<MaybeTlsStream<TcpStream>>> = vec![];
     let mut counter = 0;
 
-    for i in &exchange_info.symbols[..30] {
+    for i in &exchange_info.symbols {
         let symbol = i.symbol.clone();
         let klines_result = get_all_candles(&symbol, String::from("15m")).await;
 
