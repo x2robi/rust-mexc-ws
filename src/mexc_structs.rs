@@ -90,3 +90,5 @@ pub struct MexcExchangeInfo {
     pub server_time: i64,
     pub symbols: Vec<MexcExchangeInfoElem>,
 }
+
+pub type MexcKlineResponse = Vec<(u64, String, String, String, String, String, u64, String)>;

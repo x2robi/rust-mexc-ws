@@ -3,19 +3,15 @@ use tungstenite::{connect, Message, WebSocket};
 use serde_json::{from_str, json};
 use std::collections::HashMap;
 use std::net::TcpStream;
+use std::string::ToString;
 use tungstenite::stream::MaybeTlsStream;
+use querystring::{QueryParams, stringify as qs_stringify};
 
-mod websocket_structs;
+use kline::Kline;
+use mexc_structs::{MexcExchangeInfo, MexcKlineMessage, MexcSubscribeMessage, MexcKlineResponse, MexcSubscribeResponseMessage};
 
-#[derive(Clone)]
-struct Kline {
-    pub time: u64,
-    pub open: u64,
-    pub high: u64,
-    pub low: u64,
-    pub close: u64,
-    pub volume: u64,
-}
+mod mexc_structs;
+mod kline;
 
 const MAX_MEXC_WS_SUBSCRIPTION: usize = 30;
 
@@ -25,14 +21,23 @@ async fn main() {
 
     let exchange_info = reqwest::get("https://api.mexc.com/api/v3/exchangeInfo")
         .await.unwrap()
-        .json::<websocket_structs::MexcExchangeInfo>()
+        .json::<MexcExchangeInfo>()
         .await.unwrap();
 
     let mut params: Vec<String> = vec![];
     let mut sockets: Vec<WebSocket<MaybeTlsStream<TcpStream>>> = vec![];
+    let mut counter = 0;
 
-    for i in exchange_info.symbols {
-        params.push(i.symbol);
+    for i in &exchange_info.symbols[..30] {
+        let symbol = i.symbol.clone();
+        let klines_result = get_all_candles(&symbol, String::from("15m")).await;
+
+        klines.insert(symbol, klines_result);
+
+        params.push(i.symbol.clone());
+        counter += 1;
+
+        println!("{} | {}/{} subscriptions", i.symbol, counter, &exchange_info.symbols.len());
 
         if params.len() >= MAX_MEXC_WS_SUBSCRIPTION {
             let socket = create_socket(&params);
@@ -40,33 +45,76 @@ async fn main() {
             params.clear();
         }
     }
-    println!("{}", sockets.len());
+
     ws_event_loop(&mut sockets, &mut klines);
 }
 
+async fn get_all_candles(symbol: &str, interval: String) -> Vec<Kline> {
+    let mut klines: Vec<Kline> = vec![];
+    let mut stop = false;
+    let mut end_time: i64 = 0;
 
-fn insert_kline_in_pool(klines: &mut Vec<Kline>, data: &websocket_structs::MexcKlineMessage) {
-    let kline = Kline {
-        time: data.d.k.t as u64,
-        open: from_str::<u64>(&data.d.k.o).unwrap_or(0),
-        high: from_str::<u64>(&data.d.k.h).unwrap_or(0),
-        low: from_str::<u64>(&data.d.k.l).unwrap_or(0),
-        close: from_str::<u64>(&data.d.k.c).unwrap_or(0),
-        volume: from_str::<u64>(&data.d.k.v).unwrap_or(0),
-    };
+    while !stop {
+        let start_time_str = (end_time - 900000000).to_string();
+        let end_time_str = end_time.to_string();
 
-    let last_index = klines.len() - 1;
-    let result = klines.get(last_index)
-        .unwrap_or_else(|| {
-            klines.push(kline.clone());
+        let mut params: QueryParams = vec![
+            ("symbol", symbol),
+            ("interval", &interval),
+            ("limit", "1000"),
+            ("startTime", &start_time_str),
+            ("endTime", &end_time_str),
+        ];
 
-            klines.last().unwrap()
-        });
+        if end_time == 0 {
+            params.pop();
+            params.pop();
+        }
+
+        let klines_result = reqwest::get(format!("https://api.mexc.com/api/v3/klines?{}", qs_stringify(params)))
+            .await.unwrap()
+            .json::<MexcKlineResponse>()
+            .await.unwrap();
+
+        let mut parsed_klines: Vec<Kline> = klines_result.iter().map(|data| {
+            Kline {
+                time: data.0,
+                open: from_str::<u64>(&data.1).unwrap_or(0),
+                high: from_str::<u64>(&data.2).unwrap_or(0),
+                low: from_str::<u64>(&data.3).unwrap_or(0),
+                close: from_str::<u64>(&data.4).unwrap_or(0),
+                volume: from_str::<u64>(&data.5).unwrap_or(0),
+            }
+        }).collect();
+
+        if end_time != 0 {
+            parsed_klines.remove(0);
+        }
+
+        klines = [parsed_klines, klines].concat();
+
+        if klines_result.len() < 1000 {
+            stop = true;
+        } else {
+            end_time = klines.first().unwrap().time as i64;
+        }
+    }
+
+    return klines;
+}
+
+fn insert_kline_in_pool(klines: &mut Vec<Kline>, data: &MexcKlineMessage) {
+    if klines.len() == 0 {
+        klines.push(Kline::new(&data));
+    }
+
+    let result = klines.last().unwrap();
+    let kline = Kline::new(&data);
 
     if result.time != kline.time {
-        klines.push(kline.clone());
+        klines.push(kline);
     } else {
-        klines.insert(last_index, kline.clone());
+        let _ = klines.last().insert(&kline);
     }
 }
 
@@ -75,22 +123,18 @@ fn ws_event_loop(sockets: &mut Vec<WebSocket<MaybeTlsStream<TcpStream>>>, klines
         for socket in &mut *sockets {
             let msg = socket.read().unwrap().to_string();
 
-            if let Ok(json) = from_str::<websocket_structs::MexcKlineMessage>(&msg) {
-                let symbol = json.s.clone();
-                let candles = klines.get_mut(&symbol)
-                    .unwrap_or_else(|| {
-                        let new_vec: Vec<Kline> = vec![];
+            if let Ok(json) = from_str::<MexcKlineMessage>(&msg) {
+                println!("Symbol: {}, Close: {}", &json.s, &json.d.k.c);
 
-                        return &mut klines.insert(symbol, new_vec.clone()).unwrap();
-                    });
+                let candles = klines.entry(json.s.clone()).or_insert(vec![]);
 
                 insert_kline_in_pool(candles, &json);
 
-                println!("Symbol: {}, Close: {}", json.s, json.d.k.c);
+                continue;
             }
 
-            if let Ok(subscribe_msg) = serde_json::from_str::<websocket_structs::MexcSubscribeResponseMessage>(&msg) {
-                println!("Subscribe {}", subscribe_msg.msg);
+            if let Ok(_subscribe_msg) = from_str::<MexcSubscribeResponseMessage>(&msg) {
+                // println!("Subscribe {}", subscribe_msg.msg);
                 continue;
             }
         }
@@ -106,7 +150,7 @@ fn create_socket(symbols: &Vec<String>) -> WebSocket<MaybeTlsStream<TcpStream>> 
             .map(|e| String::from(format!("spot@public.kline.v3.api@{}@Min1", e)))
             .collect();
 
-        let subscribe_data = websocket_structs::MexcSubscribeMessage {
+        let subscribe_data = MexcSubscribeMessage {
             method: String::from("SUBSCRIPTION"),
             params,
         };
